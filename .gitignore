@@ -1,2 +1,14 @@
 uv.lock
 Sandman.egg-info/
+data/mice-ibl/*
+data/mice-MAPS/*
+data/synthetic/*
+data/monkies/*
+Writeup/*.bbl
+Writeup/*.synctex.gz
+Writeup/*.aux
+Writeup/*.log
+Writeup/*.out
+Writeup/*.toc
+.vscode/
+.venv/
