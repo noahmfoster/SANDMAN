@@ -1,9 +1,10 @@
 [project]
 name = "Sandman"
 version = "0.1.0"
-description = "Your project description"
+description = "Spiking Activity in Neurons with Diffusion Modeling Across Neural Regions"
 requires-python = ">=3.9"
 
+# Environment inspired by LDNS: https://github.com/mackelab/LDNS
 dependencies = [
     # Core dependencies
     "numpy<=1.26",
