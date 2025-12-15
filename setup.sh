@@ -44,19 +44,17 @@ if [ "$1" == "--download-data" ]; then
     else
         echo "✅ Mice (IBL) dataset already exists."
     fi
-    # Download Mice (MAPS)
-    if [ ! -d "data/mice-MAPS" ]; then
-        echo "⬇️  Downloading Mice (MAPS) dataset..."
-        mkdir -p "data/mice-MAPS"
-        uv run dandi download DANDI:000363/0.230822.0128 -o "data/mice-MAPS"
+    # Download Mice (MAP)
+    if [ ! -d "data/mice-MAP" ]; then
+        echo "⬇️  Downloading Mice (MAP) dataset..."
+        mkdir -p "data/mice-MAP"
+        uv run dandi download DANDI:000363/0.230822.0128 -o "data/mice-MAP"
     else
-        echo "✅ Mice (MAPS) dataset already exists."
+        echo "✅ Mice (MAP) dataset already exists."
     fi
     mkdir -p data/synthetic
 else
     echo "ℹ️  Skipping dataset download. To download datasets, run setup.sh with --download-data flag."
 fi  
 
-#   uv run dandi download DANDI:000128/0.220113.0400 -o data/monkeys
-#   uv run dandi download DANDI:000363/0.230822.0128 -o data/mice-MAPS
-#   echo 
+echo "🎉 Setup complete!"

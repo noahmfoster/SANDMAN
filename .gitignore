@@ -2,7 +2,7 @@ uv.lock
 Sandman.egg-info/
 data/mice-ibl/*
 data/ibl_raw/*
-data/mice-MAPS/*
+data/mice-MAP/*
 data/synthetic/*
 data/monkeys/*
 Writeup/*.bbl
