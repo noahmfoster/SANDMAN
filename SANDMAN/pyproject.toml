@@ -7,7 +7,7 @@ requires-python = ">=3.9"
 # Environment inspired by LDNS: https://github.com/mackelab/LDNS
 dependencies = [
     # Core dependencies
-    "numpy<=1.26",
+    "numpy>=1.26.1",
     "torch",
     "torchvision",
     "tqdm",
@@ -31,6 +31,7 @@ dependencies = [
     "iblatlas",
     "iblutil",
     "spikeinterface",
+    "nibabel",
 
     # Text processing
     "phonemizer>=3.0.0",
