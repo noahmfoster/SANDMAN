@@ -3,7 +3,7 @@ Sandman.egg-info/
 data/mice-ibl/*
 data/mice-MAPS/*
 data/synthetic/*
-data/monkies/*
+data/monkeys/*
 Writeup/*.bbl
 Writeup/*.synctex.gz
 Writeup/*.aux
@@ -12,3 +12,5 @@ Writeup/*.out
 Writeup/*.toc
 .vscode/
 .venv/
+__pycache__/
+*.pyc
