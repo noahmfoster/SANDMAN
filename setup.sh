@@ -31,25 +31,24 @@ if [ "$1" == "--download-data" ]; then
     mkdir -p data
     # Download Mice (IBL)
     if [ ! -d "data/mice-ibl" ]; then
-        echo "⬇️  Downloading Mice (IBL) dataset..."
-        mkdir -p data/mice-ibl
-        uv run dandi download DANDI:000032/0.220706.1533 -o data/mice-ibl
+        echo "The ibl dataset comes from running data_loader_ibl.py script which downloads data from IBL alyx server."
+        # Confirm with user whether to proceed
+        read -p "⬇️  Do you want to proceed with downloading the Mice (IBL) dataset? (y/n): " confirm
+        if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+            echo "⬇️  Downloading Mice (IBL) dataset..."
+            mkdir -p data/mice-ibl
+            uv run python SANDMAN/src/sandman/data_loading/data_loader_ibl.py
+        else
+            echo "❌ Skipping Mice (IBL) dataset download."
+        fi
     else
         echo "✅ Mice (IBL) dataset already exists."
-    fi
-    # Download Monkies
-    if [ ! -d "data/monkeys" ]; then
-        echo "⬇️  Downloading Monkies dataset..."
-        mkdir -p data/monkeys
-        uv run dandi download DANDI:000128/0.220113.0400 -o data/monkeys
-    else
-        echo "✅ Monkies dataset already exists."
     fi
     # Download Mice (MAPS)
     if [ ! -d "data/mice-MAPS" ]; then
         echo "⬇️  Downloading Mice (MAPS) dataset..."
-        mkdir -p data/mice-MAPS
-        uv run dandi download DANDI:000363/0.230822.0128 -o data/mice-MAPS
+        mkdir -p "data/mice-MAPS"
+        uv run dandi download DANDI:000363/0.230822.0128 -o "data/mice-MAPS"
     else
         echo "✅ Mice (MAPS) dataset already exists."
     fi

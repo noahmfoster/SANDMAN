@@ -1,6 +1,7 @@
 uv.lock
 Sandman.egg-info/
 data/mice-ibl/*
+data/ibl_raw/*
 data/mice-MAPS/*
 data/synthetic/*
 data/monkeys/*
@@ -14,3 +15,4 @@ Writeup/*.toc
 .venv/
 __pycache__/
 *.pyc
+*.DS_Store
