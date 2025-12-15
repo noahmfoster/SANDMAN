@@ -40,10 +40,8 @@ dependencies = [
 
     # Training
     "accelerate==1.1.1",
-]
 
-[project.optional-dependencies]
-dev = [
+    # Development tools
     "jupyter>=1.0.0",
     "pytest>=6.0.0",
     "black>=21.0.0",
