@@ -4,7 +4,6 @@ data/mice-ibl/*
 data/ibl_raw/*
 data/mice-MAP/*
 data/synthetic/*
-data/monkeys/*
 Writeup/*.bbl
 Writeup/*.synctex.gz
 Writeup/*.aux
