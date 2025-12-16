@@ -11,8 +11,6 @@ from torch.utils.data import DataLoader, RandomSampler, DistributedSampler
 from sandman.data_loading.loader_utils import DatasetDataLoader
 from sandman.paths import DATA_DIR
 
-
-#%%
 # load session_info.csv as pandas dataframe
 def load_session_data(session_ind, session_idx):
     '''
@@ -216,7 +214,7 @@ def update_area_ind_list_and_areaoi_ind(area_ind_list, areaoi):
     return area_ind_list, region_neuron_count
     
 #%%
-def make_loader(
+def make_ibl_loader(
     session_ind_list, 
     batch_size, 
     seed=42, 
@@ -335,7 +333,7 @@ def main():
     with open(DATA_DIR / "tables_and_infos/ibl_eids.txt") as file:
         eids = [line.rstrip() for line in file]
 
-    data_loader, num_neurons, datasets, areaoi_ind, area_ind_list_list, heldout_info_list, trial_type_dict = make_loader(eids, 12)
+    data_loader, num_neurons, datasets, areaoi_ind, area_ind_list_list, heldout_info_list, trial_type_dict = make_ibl_loader(eids, 12)
 
     print(heldout_info_list)
 

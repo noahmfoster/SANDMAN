@@ -15,3 +15,5 @@ Writeup/*.toc
 __pycache__/
 *.pyc
 *.DS_Store
+*test.ipynb
+tests/*

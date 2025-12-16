@@ -243,7 +243,7 @@ def update_area_ind_list_and_areaoi_ind(area_ind_list, areaoi, brain_region_list
     return areaoi_ind, area_ind_list
     
 #%%
-def make_loader(session_ind_list, batch_size, include_opto = False, seed=42, distributed=False, rank=0, world_size=1):
+def make_map_loader(session_ind_list, batch_size, include_opto = False, seed=42, distributed=False, rank=0, world_size=1):
 
     path = DATA_DIR / "tables_and_infos/"
 
@@ -366,7 +366,6 @@ def make_loader(session_ind_list, batch_size, include_opto = False, seed=42, dis
 
 def main():
     session_order = pickle.load(open(DATA_DIR / "tables_and_infos/session_order.pkl", "rb"))
-
     eids = np.sort(session_order[:40])
 
     print(eids)
@@ -376,7 +375,7 @@ def main():
 
     #breakpoint()
 
-    data_loader, num_neurons, datasets, areaoi_ind, area_ind_list_list, heldout_info_list, trial_type_dict = make_loader(eids, 12, include_opto=False)
+    data_loader, num_neurons, datasets, areaoi_ind, area_ind_list_list, heldout_info_list, trial_type_dict = make_map_loader(eids, 12, include_opto=False)
 
     print(heldout_info_list)
 
