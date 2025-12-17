@@ -194,6 +194,7 @@ class BaseDatasetRNN(torch.utils.data.Dataset):
         spikes_timestamps = np.arange(self.T)  
 
         target_behavior = self.behavior_data[idx] # T x D
+        target_behavior = target_behavior.astype(np.float32)
 
         trial_type = 0
 
