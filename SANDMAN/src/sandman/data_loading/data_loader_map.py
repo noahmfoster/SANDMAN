@@ -1,4 +1,3 @@
-# %%
 from sandman.data_loading.map_data_utils import *
 import pandas as pd
 from pynwb import NWBHDF5IO
@@ -366,6 +365,7 @@ def make_map_loader(session_ind_list, batch_size, include_opto = False, seed=42,
 
 def main():
     session_order = pickle.load(open(DATA_DIR / "tables_and_infos/session_order.pkl", "rb"))
+
     eids = np.sort(session_order[:40])
 
     print(eids)
