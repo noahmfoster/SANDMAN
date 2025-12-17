@@ -49,7 +49,7 @@ class BlinkingToyDataset(Dataset):
 
         return {
             "spikes_data": spikes,                 # [T, N]
-            "neuron_regions_full": self.neuron_regions,  # [N]
+            "neuron_regions": self.neuron_regions,  # [N]
             "eid": self.eid,                       # scalar
         }
 
@@ -61,7 +61,7 @@ def make_blinking_toy_loader(T: int, batch_size: int, device="cpu"):
     def collate_fn(batch):
         return {
             "spikes_data": torch.stack([b["spikes_data"] for b in batch], dim=0),        # [B, T, N]
-            "neuron_regions_full": torch.stack([b["neuron_regions_full"] for b in batch], dim=0),  # [B, N]
+            "neuron_regions": torch.stack([b["neuron_regions"] for b in batch], dim=0),  # [B, N]
             "eid": torch.stack([b["eid"] for b in batch], dim=0),                        # [B]
         }
 

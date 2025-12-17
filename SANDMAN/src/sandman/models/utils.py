@@ -1,29 +1,32 @@
 import torch
 import torch.nn as nn
 import math
-
-from typing import Protocol, Callable, Tuple, Optional, Dict, Any, Iterable, Union
+from typing import Protocol, Callable, Tuple, Optional, Dict, Any
 
 
 # ============================================================
-# Types
+# MaskingPolicy (UPDATED: neuron-level masks)
 # ============================================================
 
-# MaskingPolicy may return:
-#   (input_mask, target_mask)
-# or
-#   (input_mask, target_mask, masked_region_ids)
-#
-# input_mask, target_mask: Optional[BoolTensor[B, T, N]]
-# masked_region_ids: Optional[Iterable[int] | LongTensor]
+# MaskingPolicy returns three neuron-level boolean masks:
+#   corrupt_mask [B, T, N] : where inputs are corrupted (noise / zeroing / etc.)
+#   hidden_mask  [B, T, N] : where information is hidden at the REGION-token level
+#                            (implementation will hide an entire region token at (B,T)
+#                             if ANY neuron in that region is hidden at that time)
+#   target_mask  [B, T, N] : where loss is evaluated
 MaskingPolicy = Callable[
     [Dict[str, Any]],
-    Union[
-        Tuple[Optional[torch.Tensor], Optional[torch.Tensor]],
-        Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[Union[Iterable[int], torch.Tensor]]],
+    Tuple[
+        torch.Tensor,  # corrupt_mask [B,T,N]
+        torch.Tensor,  # hidden_mask  [B,T,N]
+        torch.Tensor,  # target_mask  [B,T,N]
     ],
 ]
 
+
+# ============================================================
+# TargetSpec protocol
+# ============================================================
 
 class TargetSpec(Protocol):
     """
@@ -38,13 +41,13 @@ class TargetSpec(Protocol):
         self,
         pred: torch.Tensor,
         target: torch.Tensor,
-        mask: torch.Tensor
+        mask: torch.Tensor,
     ) -> torch.Tensor:
         """Compute loss over masked entries"""
 
 
 # ============================================================
-# Targets (Poisson, neuron-level)
+# Targets (neuron-level likelihoods)
 # ============================================================
 
 class _PoissonTargetBase:
@@ -54,50 +57,38 @@ class _PoissonTargetBase:
         self.loss_fn = nn.PoissonNLLLoss(
             log_input=False,
             full=True,
-            reduction="none"
+            reduction="none",
         )
 
     def loss(
         self,
-        pred: torch.Tensor,
-        target: torch.Tensor,
-        mask: torch.Tensor
+        pred: torch.Tensor,    # [B,T,N]
+        target: torch.Tensor,  # [B,T,N]
+        mask: torch.Tensor,    # [B,T,N] bool
     ) -> torch.Tensor:
-        """
-        pred:   [B, T, N] unconstrained
-        target: [B, T, N] non-negative
-        mask:   [B, T, N] bool
-        """
         rate = self.softplus(pred)
         nll = self.loss_fn(rate, target)
         mask_f = mask.to(nll.dtype)
-
         return (nll * mask_f).sum() / mask_f.sum().clamp(min=1.0)
-    
+
+
 class _MSETargetBase:
     def __init__(self, name: str):
         self.name = name
-        self.loss_fn = nn.MSELoss(
-            reduction="none"
-        )
+        self.loss_fn = nn.MSELoss(reduction="none")
 
     def loss(
         self,
         pred: torch.Tensor,
         target: torch.Tensor,
-        mask: torch.Tensor
+        mask: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        pred:   [B, T, N] unconstrained
-        target: [B, T, N] unconstrained
-        mask:   [B, T, N] bool
-        """
         mse = self.loss_fn(pred, target)
         mask_f = mask.to(mse.dtype)
-
         return (mse * mask_f).sum() / mask_f.sum().clamp(min=1.0)
-    
-class SpikeCountTarget(_PoissonTargetBase):
+
+
+class SpikeCountPoissonTarget(_PoissonTargetBase):
     """
     Target = spike counts per bin.
     """
@@ -106,12 +97,12 @@ class SpikeCountTarget(_PoissonTargetBase):
         self.key = key
 
     def get_target(self, batch: dict) -> torch.Tensor:
-        return batch[self.key]  # [B, T, N]
+        return batch[self.key]  # [B,T,N]
 
 
-class FiringRateTarget(_PoissonTargetBase):
+class FiringRatePoissonTarget(_PoissonTargetBase):
     """
-    Target = per-bin firing rates (λ in Poisson).
+    Target = firing rates (Poisson λ).
     Optionally scaled by bin width.
     """
     def __init__(
@@ -124,194 +115,145 @@ class FiringRateTarget(_PoissonTargetBase):
         self.bin_width_seconds = bin_width_seconds
 
     def get_target(self, batch: dict) -> torch.Tensor:
-        fr = batch[self.key]  # [B, T, N]
+        fr = batch[self.key]
         if self.bin_width_seconds is not None:
             fr = fr * self.bin_width_seconds
         return fr
-    
+
+
 class SpikeCountMSETarget(_MSETargetBase):
     """
-    Target = spike counts per bin.
+    Target = spike counts per bin (MSE).
     """
     def __init__(self, key: str = "spikes_data"):
-        super().__init__(name="spike_counts_poisson")
+        super().__init__(name="spike_counts_mse")
         self.key = key
 
     def get_target(self, batch: dict) -> torch.Tensor:
-        return batch[self.key]  # [B, T, N]
+        return batch[self.key]
 
 
 # ============================================================
-# Mask utilities
+# Neuron-mask utilities (NEW)
 # ============================================================
 
-def _expand_neuron_mask(
-    neuron_mask: torch.Tensor,
-    T: int,
-) -> torch.Tensor:
-    """
-    neuron_mask: [B, N]
-    returns:     [B, T, N]
-    """
-    return neuron_mask[:, None, :].expand(-1, T, -1)
-
-
-def _normalize_masking_policy_output(
+def normalize_neuron_mask_output(
     out,
+    *,
     B: int,
     T: int,
     N: int,
-) -> Tuple[torch.Tensor, torch.Tensor, Optional[Iterable[int]]]:
-
-    if not isinstance(out, tuple):
-        raise ValueError("masking_policy must return a tuple")
-
-    if len(out) == 2:
-        input_mask, target_mask = out
-        masked_region_ids = None
-    elif len(out) == 3:
-        input_mask, target_mask, masked_region_ids = out
-    else:
-        raise ValueError(
-            "masking_policy must return (input_mask, target_mask) or "
-            "(input_mask, target_mask, masked_region_ids)"
-        )
-
-    if input_mask is None and target_mask is None:
-        raise ValueError("At least one of input_mask or target_mask must be provided")
-
-    if input_mask is None:
-        input_mask = target_mask
-    if target_mask is None:
-        target_mask = input_mask
-
-    if input_mask.shape != (B, T, N):
-        raise ValueError(f"input_mask must be [B,T,N]=({B},{T},{N}), got {input_mask.shape}")
-    if target_mask.shape != (B, T, N):
-        raise ValueError(f"target_mask must be [B,T,N]=({B},{T},{N}), got {target_mask.shape}")
-
-    return input_mask, target_mask, masked_region_ids
-
-# ============================================================
-# Masking Policies
-# ============================================================
-
-def region_inpainting_policy(batch: dict):
-    """
-    Mask ALL neurons from one randomly selected region
-    across ALL timesteps.
-
-    Returns:
-      input_mask  [B, T, N]
-      target_mask [B, T, N]
-      masked_region_ids [list[int]]
-    """
-    spikes = batch["spikes_data"]
-    regions_full = batch["neuron_regions_full"]
-
-    B, T, N = spikes.shape
-    device = spikes.device
-
-    regions = regions_full[:, :N]
-    unique_regions = torch.unique(regions)
-
-    rid = unique_regions[
-        torch.randint(len(unique_regions), (1,), device=device)
-    ].item()
-
-    neuron_mask = (regions == rid)                 # [B, N]
-    mask = neuron_mask[:, None, :].expand(B, T, N)
-
-    return mask, mask, [int(rid)]
-
-
-def random_neuron_denoising_policy(
-    batch: dict,
-    mask_prob: float = 0.15,
 ):
     """
-    Randomly mask individual neurons (not regions).
-    No region tokens are masked.
+    Validate masking policy output.
 
     Returns:
-      input_mask  [B, T, N]
-      target_mask [B, T, N]
-      masked_region_ids None
+      corrupt_mask [B,T,N]
+      hidden_mask  [B,T,N]
+      target_mask  [B,T,N]
     """
-    spikes = batch["spikes_data"]
-    B, T, N = spikes.shape
-    device = spikes.device
+    if not isinstance(out, tuple) or len(out) != 3:
+        raise ValueError(
+            "masking_policy must return (corrupt_mask, hidden_mask, target_mask) "
+            "with each mask shaped [B,T,N]"
+        )
 
-    # Sample neurons once per batch item
-    neuron_mask = (
-        torch.rand((B, N), device=device) < mask_prob
-    )
+    corrupt_nm, hidden_nm, target_nm = out
 
-    mask = neuron_mask[:, None, :].expand(B, T, N)
+    for name, m in [("corrupt_mask", corrupt_nm), ("hidden_mask", hidden_nm), ("target_mask", target_nm)]:
+        if not torch.is_tensor(m):
+            raise ValueError(f"{name} must be a torch.Tensor")
+        if m.dtype != torch.bool:
+            raise ValueError(f"{name} must be dtype=bool, got {m.dtype}")
+        if m.shape != (B, T, N):
+            raise ValueError(f"{name} must be [B,T,N]=({B},{T},{N}), got {m.shape}")
 
-    return mask, mask, None
+    return corrupt_nm, hidden_nm, target_nm
 
 
-def next_step_prediction_policy(batch: dict):
+def neuron_mask_to_region_time_mask(
+    hidden_nm: torch.Tensor,      # [B,T,N]
+    neuron_regions: torch.Tensor  # [B,N]
+) -> torch.Tensor:
     """
-    Predict x[t+1] from x[:t].
-    No corruption of inputs.
+    Convert hidden neuron mask -> region-time mask by OR-reducing within each region.
 
     Returns:
-      input_mask  [B, T, N] = all False
-      target_mask [B, T, N] = True for t >= 1
-      masked_region_ids None
+      hidden_rm [B, T, R] where R = # unique regions in neuron_regions[0]
+      and region ordering is torch.unique(neuron_regions[0]) (sorted).
     """
-    spikes = batch["spikes_data"]
-    B, T, N = spikes.shape
-    device = spikes.device
+    if hidden_nm.dtype != torch.bool:
+        raise ValueError("hidden_nm must be bool")
+    if neuron_regions.ndim != 2:
+        raise ValueError("neuron_regions must be [B,N]")
 
-    input_mask = torch.zeros((B, T, N), dtype=torch.bool, device=device)
+    B, T, N = hidden_nm.shape
+    unique_regions = torch.unique(neuron_regions[0])  # sorted
+    R = len(unique_regions)
 
-    target_mask = torch.zeros((B, T, N), dtype=torch.bool, device=device)
-    target_mask[:, 1:, :] = True   # predict future
+    device = hidden_nm.device
+    hidden_rm = torch.zeros((B, T, R), dtype=torch.bool, device=device)
 
-    return input_mask, target_mask, None
+    for r_idx, rid in enumerate(unique_regions):
+        idxs = torch.where(neuron_regions[0] == rid)[0]  # [N_r]
+        # OR over neurons in region at each (B,T)
+        hidden_rm[:, :, r_idx] = hidden_nm.index_select(dim=2, index=idxs).any(dim=2)
 
-def no_mask_policy(batch):
-    spikes = batch["spikes_data"]
-    B, T, N = spikes.shape
-    mask = torch.ones((B, T, N), dtype=torch.bool, device=spikes.device)
-    return mask, mask
-
+    return hidden_rm
 
 
 # ============================================================
-# Example masking policy: region inpainting
+# Example neuron-level masking policies (UPDATED)
 # ============================================================
 
-def mask_one_region_policy(batch: dict):
+def mask_one_region_some_times(
+    batch: dict,
+    p_time: float = 0.5,
+):
     """
-    Randomly selects ONE region and:
-      - corrupts all its neurons at all timesteps
-      - computes loss on those neurons
-      - injects a region-level mask token
-
-    Returns:
-      input_mask  [B, T, N]
-      target_mask [B, T, N]
-      masked_region_ids [list[int]]
+    Masks a single region for a random subset of time steps, expressed at neuron level.
+    (Internally the model will convert hidden_nm -> hidden_rm by OR over neurons in region.)
+    Target mask is constant across time.
     """
-    spikes = batch["spikes_data"]              # [B, T, N]
-    regions_full = batch["neuron_regions_full"]
+    spikes = batch["spikes_data"]  # [B,T,N]
+    regions = batch["neuron_regions"]
 
     B, T, N = spikes.shape
     device = spikes.device
-
-    regions = regions_full[:, :N]
-    unique_regions = torch.unique(regions)
-
+    neuron_regions = regions
+    unique_regions = torch.unique(neuron_regions[0])
     rid = unique_regions[torch.randint(len(unique_regions), (1,), device=device)].item()
 
-    neuron_mask = (regions == rid)             # [B, N]
-    mask = _expand_neuron_mask(neuron_mask, T)
+    # time mask shared across batch (simple + stable)
+    time_mask = (torch.rand(T, device=device) < p_time)[None, :, None].expand(B, -1, -1)  # [B,T,1]
 
-    return mask, mask, [int(rid)]
+    # neuron mask for chosen region
+    region_neuron_mask = (neuron_regions == rid)[:, None, :].expand(B, T, N)  # [B,T,N]
+
+    hidden_nm = region_neuron_mask & time_mask
+    corrupt_nm = hidden_nm.clone()          # default: corrupt where hidden
+    target_nm = region_neuron_mask.clone()  # default: evaluate loss everywhere
+
+    return corrupt_nm, hidden_nm, target_nm
+
+def mask_one_region(batch: dict):
+    """
+    Masks a single region for all time steps.
+    """
+    return mask_one_region_some_times(batch, p_time=1.0)
+
+
+def no_mask_policy(batch: dict):
+    """
+    No corruption, no hiding, no loss.
+    (Useful for debugging; for training, you probably want a non-empty target mask.)
+    """
+    spikes = batch["spikes_data"]
+    B, T, N = spikes.shape
+    device = spikes.device
+    z = torch.zeros((B, T, N), dtype=torch.bool, device=device)
+    o = torch.ones((B, T, N), dtype=torch.bool, device=device)
+    return o, z, o
 
 
 # ============================================================
@@ -333,28 +275,14 @@ def move_scheduler_to_device(scheduler, device):
 # ============================================================
 
 def build_rope_cache(T: int, D: int, device):
-    assert D % 2 == 0
+    assert D % 2 == 0, "RoPE requires even D"
     half = D // 2
-
-    freq = torch.exp(
-        -math.log(10000) * torch.arange(0, half, device=device) / half
-    )  # [half]
-
-    t = torch.arange(T, device=device).float()  # [T]
-    angles = t[:, None] * freq[None, :]         # [T, half]
-
-    cos = angles.cos()[None, :, None, :]        # [1, T, 1, half]
-    sin = angles.sin()[None, :, None, :]        # [1, T, 1, half]
-    return cos, sin
+    freq = torch.exp(-math.log(10000) * torch.arange(half, device=device) / half)
+    t = torch.arange(T, device=device).float()
+    angles = t[:, None] * freq[None, :]
+    return angles.cos()[None, :, None, :], angles.sin()[None, :, None, :]
 
 
 def apply_rope_time(x, cos, sin):
-    """
-    x: [B, T, R, D]
-    """
     x1, x2 = x[..., ::2], x[..., 1::2]
-    return torch.cat(
-        [x1 * cos - x2 * sin,
-         x1 * sin + x2 * cos],
-        dim=-1
-    )
+    return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)

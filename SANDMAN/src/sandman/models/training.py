@@ -13,12 +13,11 @@ from sandman.models.diffusion import DiffusionWrapper, NeuralTransformer
 from sandman.models.utils import (
     TargetSpec,
     MaskingPolicy,
-    SpikeCountTarget,
-    # NEW policies (preferred names)
-    region_inpainting_policy,
-    random_neuron_denoising_policy,
-    next_step_prediction_policy,
+    SpikeCountMSETarget,
+    mask_one_region,
+    no_mask_policy,
 )
+
 
 # ============================================================
 # Training
@@ -115,6 +114,7 @@ def prepare_data_and_model(
     weight_decay: float = 1e-4,
     num_warmup_steps: int = 500,
     wandb_enabled: bool = True,
+    reconstruct_loss_weight: float = 0.0,
 ):
     """
     Returns:
@@ -134,7 +134,7 @@ def prepare_data_and_model(
     # Defaults
     if masking_policy is None:
         # Best default for your inpainting goal
-        masking_policy = region_inpainting_policy
+        masking_policy = mask_one_region
 
         # Alternatives you can pass instead:
         # masking_policy = lambda batch: random_neuron_denoising_policy(batch, mask_prob=0.15)
@@ -142,7 +142,7 @@ def prepare_data_and_model(
 
     if target_spec is None:
         # Works everywhere
-        target_spec = SpikeCountTarget(key="spikes_data")
+        target_spec = SpikeCountMSETarget(key="spikes_data")
 
     accelerator = Accelerator()
     device = accelerator.device
@@ -179,6 +179,7 @@ def prepare_data_and_model(
         scheduler=noise_scheduler,
         target_spec=target_spec,
         masking_policy=masking_policy,
+        reconstruct_loss_weight=reconstruct_loss_weight,
     )
 
     if accelerator.is_main_process and wandb_enabled:

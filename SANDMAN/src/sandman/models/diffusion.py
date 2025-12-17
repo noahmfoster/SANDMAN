@@ -1,10 +1,15 @@
 import torch
 import torch.nn as nn
 
-from sandman.models.utils import apply_rope_time, build_rope_cache
+from sandman.models.utils import (
+    apply_rope_time,
+    build_rope_cache,
+    normalize_neuron_mask_output,
+    neuron_mask_to_region_time_mask,
+)
 from sandman.models.utils import TargetSpec
 
-from typing import Optional, Iterable, Tuple, Union
+from typing import Dict
 
 
 # ============================================================
@@ -12,33 +17,20 @@ from typing import Optional, Iterable, Tuple, Union
 # ============================================================
 
 class RegionEncoder(nn.Module):
-    def __init__(self, d_model, encoder_n_heads: int = 4):
+    """
+    SIMPLE region encoder: [B, T, N_r] -> [B, T, D]
+    """
+    def __init__(self, d_model: int, n_neurons: int):
         super().__init__()
-        self.neuron_proj = nn.Linear(1, d_model)
-        self.attn = nn.MultiheadAttention(d_model, num_heads=encoder_n_heads, batch_first=True)
-        self.norm = nn.LayerNorm(d_model)
+        self.d_model = int(d_model)
+        self.n_neurons = int(n_neurons)
+        self.proj = nn.Linear(self.n_neurons, self.d_model)
 
-    def forward(self, spikes_region):
-        """
-        spikes_region: [B, T, N_r]
-        returns:       [B, T, D]
-        """
+    def forward(self, spikes_region: torch.Tensor) -> torch.Tensor:
         B, T, N_r = spikes_region.shape
-
-        # [B, T, N_r, D]
-        x = self.neuron_proj(spikes_region[..., None])
-
-        # Treat neurons as tokens *per time*
-        x = x.view(B * T, N_r, -1)
-
-        # Self-attention across neurons
-        x, _ = self.attn(x, x, x)
-
-        # Pool AFTER attention
-        x = x.mean(dim=1)  # [B*T, D]
-
-        x = x.view(B, T, -1)
-        return self.norm(x)
+        if N_r != self.n_neurons:
+            raise ValueError(f"RegionEncoder expected N_r={self.n_neurons}, got {N_r}")
+        return self.proj(spikes_region)
 
 
 # ============================================================
@@ -46,318 +38,361 @@ class RegionEncoder(nn.Module):
 # ============================================================
 
 class RegionDecoder(nn.Module):
-    """
-    One Linear per (eid, region): D -> N_region_neurons
-    """
     def __init__(self, d_model: int, n_neurons: int):
         super().__init__()
-        self.n_neurons = int(n_neurons)
-        self.readout = nn.Linear(d_model, self.n_neurons)
+        self.readout = nn.Linear(d_model, n_neurons)
 
     def forward(self, region_token: torch.Tensor) -> torch.Tensor:
-        """
-        region_token: [B, T, D]
-        returns:      [B, T, N_r]
-        """
         return self.readout(region_token)
 
 
 # ============================================================
-# Dictionary of encoders / decoders keyed by (eid, region)
+# Region codec dictionary
 # ============================================================
 
 class RegionCodecDict(nn.Module):
-    """
-    Holds (encoder, decoder) pairs for each (eid, region).
-    Tracks neuron indices so we can scatter predictions back into original neuron order.
-    """
-    def __init__(self, d_model: int, encoder_n_heads: int = 4):
+    def __init__(self, d_model: int):
         super().__init__()
         self.d_model = d_model
-        self.encoder_n_heads = encoder_n_heads
         self.encoders = nn.ModuleDict()
         self.decoders = nn.ModuleDict()
-        self._decoder_n_neurons = {}  # key -> int (python cache)
+        self._n_neurons = {}
 
-    def _key(self, eid, region_id) -> str:
+    def _key(self, eid, region_id):
         return f"{int(eid)}:{int(region_id)}"
 
-    def get_codec(self, eid, region_id, n_neurons: int, device: torch.device):
+    def get_codec(self, eid, region_id, n_neurons, device):
         key = self._key(eid, region_id)
+        n_neurons = int(n_neurons)
 
         if key not in self.encoders:
-            self.encoders[key] = RegionEncoder(self.d_model, encoder_n_heads=self.encoder_n_heads).to(device)
-            self.decoders[key] = RegionDecoder(self.d_model, int(n_neurons)).to(device)
-            self._decoder_n_neurons[key] = int(n_neurons)
-        else:
-            expected = self._decoder_n_neurons.get(key, None)
-            if expected is not None and int(n_neurons) != expected:
-                raise ValueError(
-                    f"Neuron count changed for codec {key}: expected {expected}, got {int(n_neurons)}.\n"
-                    "If this is intended (dynamic neuron set), you need a more flexible decoder design."
-                )
+            self.encoders[key] = RegionEncoder(self.d_model, n_neurons).to(device)
+            self.decoders[key] = RegionDecoder(self.d_model, n_neurons).to(device)
+            self._n_neurons[key] = n_neurons
+        elif self._n_neurons[key] != n_neurons:
+            raise ValueError(f"Neuron count changed for {key}")
 
         return self.encoders[key], self.decoders[key]
 
-    def encode(self, spikes: torch.Tensor, neuron_regions: torch.Tensor, eids: torch.Tensor):
-        """
-        spikes:         [B, T, N]
-        neuron_regions: [B, N]
-        eids:           [B]
-
-        Returns:
-          region_tokens:  {(eid, region_id): [B, T, D]}
-          region_indices: {(eid, region_id): LongTensor[N_r]}
-        """
+    def encode(self, spikes, neuron_regions, eids):
         device = spikes.device
         region_tokens = {}
         region_indices = {}
 
-        # Assumption: one eid per batch
         eid = int(eids[0].item())
-
         unique_regions = torch.unique(neuron_regions[0])
 
         for rid in unique_regions:
-            region_id = int(rid.item())
-
-            idxs = torch.nonzero(neuron_regions[0] == region_id, as_tuple=False).squeeze(-1)  # [N_r]
-            spikes_region = spikes.index_select(dim=2, index=idxs)  # [B, T, N_r]
-
-            encoder, _ = self.get_codec(eid, region_id, n_neurons=idxs.numel(), device=device)
-            token = encoder(spikes_region)  # [B, T, D]
-
-            key = (eid, region_id)
-            region_tokens[key] = token
-            region_indices[key] = idxs
+            rid = int(rid.item())
+            idxs = torch.where(neuron_regions[0] == rid)[0]
+            spikes_r = spikes.index_select(2, idxs)
+            enc, _ = self.get_codec(eid, rid, idxs.numel(), device)
+            region_tokens[(eid, rid)] = enc(spikes_r)
+            region_indices[(eid, rid)] = idxs
 
         return region_tokens, region_indices
 
-    def decode_to_full(
-        self,
-        region_tokens: dict,
-        region_indices: dict,
-        N_total: int,
-    ) -> torch.Tensor:
-        """
-        region_tokens:  {(eid, region_id): [B, T, D]}
-        region_indices: {(eid, region_id): [N_r]}
+    def decode_to_full(self, region_tokens, region_indices, N):
+        any_tok = next(iter(region_tokens.values()))
+        B, T, _ = any_tok.shape
+        out = torch.zeros(B, T, N, device=any_tok.device, dtype=any_tok.dtype)
 
-        Returns:
-          pred_full: [B, T, N_total]
-        """
-        any_token = next(iter(region_tokens.values()))
-        B, T, _ = any_token.shape
-        device = any_token.device
-        dtype = any_token.dtype
+        for (eid, rid), tok in region_tokens.items():
+            idxs = region_indices[(eid, rid)]
+            _, dec = self.get_codec(eid, rid, idxs.numel(), tok.device)
+            out.index_copy_(2, idxs, dec(tok))
 
-        pred_full = torch.zeros((B, T, N_total), device=device, dtype=dtype)
-
-        for (eid, region_id), token in region_tokens.items():
-            idxs = region_indices[(eid, region_id)]
-            _, decoder = self.get_codec(eid, region_id, n_neurons=idxs.numel(), device=device)
-            pred_region = decoder(token)  # [B, T, N_r]
-
-            pred_full.index_copy_(dim=2, index=idxs, source=pred_region)
-
-        return pred_full
+        return out
 
 
 # ============================================================
-# Transformer over (time × region) tokens
+# Denoising block
+# ============================================================
+
+class DenoisingBlock(nn.Module):
+    def __init__(self, d_model, n_heads):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
+        self.ln1 = nn.LayerNorm(d_model)
+        self.ln2 = nn.LayerNorm(d_model)
+        self.ff = nn.Sequential(
+            nn.Linear(d_model, 4 * d_model),
+            nn.GELU(),
+            nn.Linear(4 * d_model, d_model),
+        )
+
+    def forward(self, x):
+        h = self.ln1(x)
+        x = x + self.attn(h, h, h)[0]
+        h = self.ln2(x)
+        return x + self.ff(h)
+
+
+class TimestepMLP(nn.Module):
+    """
+    Map integer timesteps -> learned embedding -> [B, D].
+    Simple + effective for DDPM.
+    """
+    def __init__(self, d_model: int, max_steps: int = 2048):
+        super().__init__()
+        self.embed = nn.Embedding(max_steps, d_model)
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, 4 * d_model),
+            nn.SiLU(),
+            nn.Linear(4 * d_model, d_model),
+        )
+
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        # t: [B] long
+        return self.mlp(self.embed(t))
+
+
+# ============================================================
+# Neural Transformer
 # ============================================================
 
 class NeuralTransformer(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, n_layers: int, encoder_n_heads: int = 4):
+    def __init__(self, d_model, n_heads, n_layers):
         super().__init__()
-        self.d_model = d_model
-        self.region_codecs = RegionCodecDict(d_model, encoder_n_heads=encoder_n_heads)
+        self.d_model = int(d_model)
+        self.region_codecs = RegionCodecDict(self.d_model)
 
-        # Learned region-mask token (available but optional)
-        self.region_mask_token = nn.Parameter(torch.zeros(1, 1, d_model))
+        self.region_mask_token = nn.Parameter(torch.zeros(1, 1, self.d_model))
+        self.region_id_embed = nn.Embedding(512, self.d_model)
 
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=n_heads,
-            batch_first=True
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, n_layers)
+        self.blocks = nn.ModuleList([
+            DenoisingBlock(self.d_model, n_heads) for _ in range(n_layers)
+        ])
+        self.final_ln = nn.LayerNorm(self.d_model)
+
         self.rope_cache = None
+        self.t_embed = TimestepMLP(self.d_model, max_steps=2048)
 
-    @staticmethod
-    def _normalize_masked_region_ids(
-        masked_region_ids: Optional[Union[Iterable[int], torch.Tensor]]
-    ) -> Optional[set]:
-        if masked_region_ids is None:
-            return None
-        if torch.is_tensor(masked_region_ids):
-            # allow LongTensor of region ids
-            if masked_region_ids.numel() == 0:
-                return set()
-            return set(int(x) for x in torch.unique(masked_region_ids).tolist())
-        return set(int(x) for x in masked_region_ids)
+    def _sorted_keys(self, region_tokens):
+        return sorted(region_tokens.keys(), key=lambda x: x[1])
 
-    def forward(
+    def spikes_to_region_latents(
         self,
-        spikes_noisy: torch.Tensor,   # [B, T, N]
-        neuron_regions: torch.Tensor, # [B, N]
-        eids: torch.Tensor,           # [B]
-        timesteps: torch.Tensor,      # [B] (unused for now)
+        spikes: torch.Tensor,
+        neuron_regions: torch.Tensor,
+        eids: torch.Tensor,
         *,
-        masked_region_ids: Optional[Union[Iterable[int], torch.Tensor]] = None,
+        hidden_nm: torch.Tensor,   # [B,T,N] bool
     ):
-        B, T, N = spikes_noisy.shape
-        device = spikes_noisy.device
+        """
+        Returns:
+          x_latent: [B,T,R,D]
+          keys, region_indices, N_total
 
-        masked_set = self._normalize_masked_region_ids(masked_region_ids)
+        Region token is replaced at (B,T,region) if ANY neuron in that region is hidden at (B,T).
+        """
+        region_tokens, region_indices = self.region_codecs.encode(spikes, neuron_regions, eids)
+        keys = self._sorted_keys(region_tokens)
 
-        # Encode neurons -> region tokens + keep neuron indices for each region
-        region_tokens, region_indices = self.region_codecs.encode(
-            spikes_noisy, neuron_regions, eids
-        )
+        # Derive region-time mask from hidden neuron mask
+        hidden_rm = neuron_mask_to_region_time_mask(hidden_nm, neuron_regions)  # [B,T,R]
 
-        # OPTIONAL: replace selected region tokens with learned mask token
-        # This is the inpainting signal. If masked_set is None/empty, no masking happens.
-        if masked_set:
-            for (eid_k, region_id) in list(region_tokens.keys()):
-                if int(region_id) in masked_set:
-                    region_tokens[(eid_k, region_id)] = self.region_mask_token.expand(B, T, -1)
+        out = {}
+        for r_idx, k in enumerate(keys):
+            tok = region_tokens[k]  # [B,T,D]
+            B, T, D = tok.shape
 
-        # Stable region ordering for stacking
-        keys = sorted(region_tokens.keys(), key=lambda x: x[1])
+            mask_bt = hidden_rm[:, :, r_idx]  # [B,T]
+            if mask_bt.any():
+                rid = int(k[1])
+                rid_t = torch.tensor(rid, device=tok.device)
+                rid_emb = self.region_id_embed(rid_t)[None, None, :]  # [1,1,D]
+                mask_tok = self.region_mask_token.expand(B, T, -1) + rid_emb  # [B,T,D]
+                tok = torch.where(mask_bt[..., None], mask_tok, tok)
 
-        x = torch.stack([region_tokens[k] for k in keys], dim=2)  # [B, T, R, D]
-        R = x.size(2)
+            out[k] = tok
+
+        x = torch.stack([out[k] for k in keys], dim=2)  # [B,T,R,D]
+        return x, keys, region_indices, spikes.size(2)
+
+    def denoise_region_latents(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """
+        Predict epsilon in latent space.
+
+        x: [B,T,R,D] = x_t
+        t: [B] long timesteps
+
+        returns: eps_pred [B,T,R,D]
+        """
+        B, T, R, D = x.shape
 
         # RoPE over time
         if (
             self.rope_cache is None
             or self.rope_cache[0].shape[1] != T
-            or self.rope_cache[0].device != device
+            or self.rope_cache[0].device != x.device
         ):
-            self.rope_cache = build_rope_cache(T, self.d_model, device)
-        cos, sin = self.rope_cache
-        x = apply_rope_time(x, cos, sin)
+            self.rope_cache = build_rope_cache(T, D, x.device)
+        x = apply_rope_time(x, *self.rope_cache)
 
-        # Transformer over flattened (T * R) tokens
-        x = x.view(B, T * R, self.d_model)
-        x = self.transformer(x)
-        x = x.view(B, T, R, self.d_model)
+        # Add timestep conditioning (broadcast to all tokens)
+        t_emb = self.t_embed(t).to(x.dtype)         # [B,D]
+        x = x + t_emb[:, None, None, :]             # [B,T,R,D]
 
-        # Unstack back into dict of region tokens
-        updated_region_tokens = {key: x[:, :, i, :] for i, key in enumerate(keys)}
+        # Transformer blocks
+        x = x.view(B, T * R, D)
+        for blk in self.blocks:
+            x = blk(x)
+        x = self.final_ln(x)
+        x = x.view(B, T, R, D)
 
-        # Decode into full neuron order [B, T, N]
-        pred_full = self.region_codecs.decode_to_full(
-            updated_region_tokens, region_indices, N_total=N
+        return x  # interpret as eps_pred
+
+    def region_latents_to_spikes(self, x, keys, region_indices, N):
+        region_tokens = {k: x[:, :, i] for i, k in enumerate(keys)}
+        return self.region_codecs.decode_to_full(region_tokens, region_indices, N)
+
+    def forward(
+        self,
+        batch: dict,
+        *,
+        masking_policy=None,
+    ):
+        """
+        Convenience forward (NO diffusion, NO loss). Useful for quick inference/debug.
+
+        Returns:
+            pred_full : [B, T, N]
+        """
+        spikes = batch["spikes_data"]           # [B,T,N]
+        neuron_regions = batch["neuron_regions"]  # [B,N]
+        eids = batch["eid"].view(-1)
+
+        B, T, N = spikes.shape
+        device = spikes.device
+
+        hidden_nm = None
+        if masking_policy is not None:
+            _, hidden_nm, _ = masking_policy(batch)
+
+        # Encode neurons -> region tokens
+        region_tokens, region_indices = self.region_codecs.encode(
+            spikes,
+            neuron_regions,
+            eids,
         )
+        keys = self._sorted_keys(region_tokens)
 
-        return pred_full, keys
+        # Apply region-time masking (derived from hidden_nm)
+        if hidden_nm is not None:
+            hidden_rm = neuron_mask_to_region_time_mask(hidden_nm, neuron_regions)  # [B,T,R]
+
+            out = {}
+            for r_idx, k in enumerate(keys):
+                tok = region_tokens[k]  # [B,T,D]
+                mask_bt = hidden_rm[:, :, r_idx]  # [B,T]
+
+                if mask_bt.any():
+                    rid = torch.tensor(k[1], device=device)
+                    rid_emb = self.region_id_embed(rid)[None, None, :]  # [1,1,D]
+                    mask_tok = self.region_mask_token + rid_emb  # [1,1,D] broadcastable
+
+                    tok = torch.where(mask_bt[..., None], mask_tok, tok)
+                out[k] = tok
+            region_tokens = out
+
+        # Stack + RoPE + transformer (no timestep conditioning here)
+        x = torch.stack([region_tokens[k] for k in keys], dim=2)  # [B,T,R,D]
+
+        if self.rope_cache is None or self.rope_cache[0].shape[1] != T or self.rope_cache[0].device != device:
+            self.rope_cache = build_rope_cache(T, self.d_model, device)
+        x = apply_rope_time(x, *self.rope_cache)
+
+        x = x.view(B, T * len(keys), self.d_model)
+        for blk in self.blocks:
+            x = blk(x)
+        x = self.final_ln(x)
+        x = x.view(B, T, len(keys), self.d_model)
+
+        # Decode region latents -> full neuron predictions
+        region_tokens_out = {k: x[:, :, i] for i, k in enumerate(keys)}
+        pred_full = self.region_codecs.decode_to_full(region_tokens_out, region_indices, N)
+        return pred_full
 
 
 # ============================================================
-# Diffusion wrapper (loss in neuron space)
+# Diffusion Wrapper
 # ============================================================
 
 class DiffusionWrapper(nn.Module):
     """
-    Diffusion wrapper with optional inpainting semantics via masked_region_ids.
+    True diffusion training in region-latent space using epsilon-prediction:
+        x_t = add_noise(x0, eps, t)
+        eps_pred = model(x_t, t)
+        loss = MSE(eps_pred, eps)
 
-    Mask semantics:
-      - input_mask  [B, T, N] bool : neurons to corrupt (diffuse)
-      - target_mask [B, T, N] bool : neurons to score in the loss
-
-    Inpainting semantics (optional):
-      - masked_region_ids: iterable/tensor of region IDs whose region tokens are replaced
-        by the learned region_mask_token in the transformer.
-      - If None/empty, model behaves like a normal transformer (no mask tokens injected).
+    Notes:
+      - target_spec is kept in the signature for compatibility with your training setup,
+        but epsilon-prediction training does not use it directly.
+      - masking_policy still controls:
+          corrupt_nm: what you overwrite in neuron space before encoding
+          hidden_nm:  which region-times receive mask tokens in latent space
+          target_nm:  currently unused for epsilon training (kept for future hybrid losses)
     """
-    def __init__(self, model, scheduler, target_spec: TargetSpec, masking_policy):
+    def __init__(self, model, scheduler, target_spec: TargetSpec, masking_policy, reconstruct_loss_weight=1.0):
         super().__init__()
         self.model = model
         self.scheduler = scheduler
         self.target_spec = target_spec
         self.masking_policy = masking_policy
+        self.reconstruct_loss_weight = reconstruct_loss_weight
         self.disable_diffusion = False
 
-    def _run_masking_policy(self, batch: dict):
-        out = self.masking_policy(batch)
 
-        if not isinstance(out, tuple):
-            raise ValueError("masking_policy must return a tuple")
-
-        if len(out) == 2:
-            input_mask, target_mask = out
-            masked_region_ids = None
-        elif len(out) == 3:
-            input_mask, target_mask, masked_region_ids = out
-        else:
-            raise ValueError(
-                "masking_policy must return either (input_mask, target_mask) or "
-                "(input_mask, target_mask, masked_region_ids)"
-            )
-
-        return input_mask, target_mask, masked_region_ids
-
-    def forward(self, batch: dict) -> torch.Tensor:
-        spikes = batch["spikes_data"]  # [B, T, N]
-        neuron_regions_full = batch["neuron_regions_full"]
-        eids = batch["eid"]
-        if eids.ndim == 0:
-            eids = eids[None]
+    def forward(self, batch: dict):
+        spikes = batch["spikes_data"]              # [B,T,N]
+        neuron_regions = batch["neuron_regions"]   # [B,N]
+        eids = batch["eid"].view(-1)
 
         B, T, N = spikes.shape
-        device = spikes.device
-        neuron_regions = neuron_regions_full[:, :N]
 
-        # Masks + optional masked_region_ids (policy decides)
-        input_mask, target_mask, masked_region_ids = self._run_masking_policy(batch)
+        corrupt_nm, hidden_nm, target_nm = normalize_neuron_mask_output(
+            self.masking_policy(batch),
+            B=B,
+            T=T,
+            N=N,
+        )  # all [B,T,N] bool
 
-        if input_mask is None and target_mask is None:
-            raise ValueError("masking_policy must return at least one mask")
+        # 1) Corrupt inputs in neuron space (keeps your masking semantics)
+        spikes_corrupt = torch.where(corrupt_nm, torch.zeros_like(spikes), spikes)
 
-        # default behavior: if one is None, use the other
-        if input_mask is None:
-            input_mask = target_mask
-        if target_mask is None:
-            target_mask = input_mask
+        # 2) Encode -> region latents (x0) and inject region-mask tokens based on hidden_nm
+        x0, keys, region_indices, N_total = self.model.spikes_to_region_latents(
+            spikes_corrupt, neuron_regions, eids, hidden_nm=hidden_nm
+        )  # x0: [B,T,R,D]
 
-        if input_mask.shape != (B, T, N) or target_mask.shape != (B, T, N):
-            raise ValueError(
-                f"Expected masks [B,T,N]=({B},{T},{N}), got {input_mask.shape} and {target_mask.shape}"
-            )
-
-        # Diffusion timestep
-        timesteps = torch.randint(
+        # 3) Sample timestep and noise, construct x_t
+        t = torch.randint(
             0, self.scheduler.config.num_train_timesteps,
-            (B,), device=device
+            (B,), device=spikes.device, dtype=torch.long
         )
 
-        # Add noise + corrupt only masked inputs
-        noise = torch.randn_like(spikes)
-        x_noisy_all = self.scheduler.add_noise(spikes, noise, timesteps)
-        spikes_noisy = torch.where(input_mask, x_noisy_all, spikes)
+        eps = torch.randn_like(x0)
         if self.disable_diffusion:
-            spikes_noisy = spikes # for debugging: no noise, 
+            x_t = x0
+        else:
+            x_t = self.scheduler.add_noise(x0, eps, t)
 
-        # Model predicts in neuron space aligned to original ordering
-        pred_full, _ = self.model(
-            spikes_noisy,
-            neuron_regions,
-            eids,
-            timesteps,
-            masked_region_ids=masked_region_ids,  # <-- optional inpainting signal
-        )  # [B, T, N]
+        # 4) Predict epsilon (true diffusion objective)
+        eps_pred = self.model.denoise_region_latents(x_t, t)   # [B,T,R,D]
 
-        # Target
-        target = self.target_spec.get_target(batch)[:, :, :N]  # [B, T, N]
+        # 5) MSE loss in latent space (DDPM epsilon loss)
+        diff_loss = torch.mean((eps_pred - eps) ** 2)
 
-        # Loss only on target_mask (TargetSpec handles Poisson + softplus etc.)
-        loss = self.target_spec.loss(pred=pred_full, target=target, mask=target_mask)
+        # 6) Reconstion loss in neuron space
+        pred_recon = self.model.region_latents_to_spikes(
+            x0, keys, region_indices, N_total
+        )
+        target = self.target_spec.get_target(batch)
+        recon_loss = self.target_spec.loss(
+            pred=pred_recon,
+            target=target,
+            mask=torch.ones_like(target, dtype=torch.bool),
+        )
 
-        if torch.isnan(loss) or torch.isinf(loss):
-            raise RuntimeError("Loss exploded")
-
-        if loss.item() < 1e-6:
-            print("WARNING: near-zero loss")
-        return loss
+        return diff_loss + self.reconstruct_loss_weight * recon_loss
