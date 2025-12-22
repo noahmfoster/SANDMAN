@@ -24,7 +24,7 @@ class RegionEncoder(nn.Module):
         super().__init__()
         self.d_model = int(d_model)
         self.n_neurons = int(n_neurons)
-        self.proj = nn.Linear(self.n_neurons, self.d_model)
+        self.proj = nn.Linear(self.n_neurons,  self.d_model)
 
     def forward(self, spikes_region: torch.Tensor) -> torch.Tensor:
         B, T, N_r = spikes_region.shape
