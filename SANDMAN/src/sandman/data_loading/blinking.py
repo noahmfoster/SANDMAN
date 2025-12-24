@@ -2,12 +2,13 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 
 class BlinkingToyDataset(Dataset):
-    def __init__(self, T: int = 100, device="cpu"):
+    def __init__(self, T: int = 100, device="cpu", length: int = 1000):
         """
         T: number of timesteps
         """
         self.T = T
         self.device = device
+        self.length = length
 
         # neurons: [A, B, C, D, E, F, G, H]
         self.neuron_regions = torch.tensor(
@@ -19,7 +20,7 @@ class BlinkingToyDataset(Dataset):
         self.eid = torch.tensor(0, dtype=torch.long, device=device)
 
     def __len__(self):
-        return 1000  # arbitrary
+        return self.length
 
     def __getitem__(self, idx):
         T = self.T
@@ -54,9 +55,9 @@ class BlinkingToyDataset(Dataset):
         }
 
 
-def make_blinking_toy_loader(T: int, batch_size: int, device="cpu"):
+def make_blinking_toy_loader(T: int, batch_size: int, device="cpu", length: int = 1000):
 
-    dataset = BlinkingToyDataset(T=T, device=device)
+    dataset = BlinkingToyDataset(T=T, device=device, length=length)
 
     def collate_fn(batch):
         return {

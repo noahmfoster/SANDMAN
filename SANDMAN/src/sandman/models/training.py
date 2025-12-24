@@ -4,7 +4,8 @@ from typing import Optional, Dict, Any
 from accelerate import Accelerator
 from diffusers.optimization import get_scheduler
 from diffusers.schedulers import DDPMScheduler
-from tqdm.notebook import tqdm
+# from tqdm.notebook import tqdm
+from tqdm import tqdm
 import wandb
 
 from sandman.models.utils import move_scheduler_to_device
@@ -80,7 +81,7 @@ def train_epoch(
 
         if accelerator.is_main_process and (step % log_every == 0) and wandb_enabled:
             wandb.log({
-                "train/loss_step": loss_item,
+                f"train-{diffusion.stage}/loss_step": loss_item,
                 # "train/epoch": epoch,
                 # "train/step": step,
             })
@@ -89,7 +90,7 @@ def train_epoch(
 
     if accelerator.is_main_process and wandb_enabled:
         wandb.log({
-            "train/loss_epoch": avg_loss,
+            f"train-{diffusion.stage}/loss_epoch": avg_loss,
             "epoch": epoch,
         })
 
@@ -114,7 +115,7 @@ def prepare_data_and_model(
     weight_decay: float = 1e-4,
     num_warmup_steps: int = 500,
     wandb_enabled: bool = True,
-    reconstruct_loss_weight: float = 0.0,
+    reconstruct_loss_weight: float = 0.1,
 ):
     """
     Returns:
@@ -133,12 +134,7 @@ def prepare_data_and_model(
 
     # Defaults
     if masking_policy is None:
-        # Best default for your inpainting goal
         masking_policy = mask_one_region
-
-        # Alternatives you can pass instead:
-        # masking_policy = lambda batch: random_neuron_denoising_policy(batch, mask_prob=0.15)
-        # masking_policy = next_step_prediction_policy
 
     if target_spec is None:
         # Works everywhere
@@ -153,7 +149,7 @@ def prepare_data_and_model(
             project=wandb_project,
             name=wandb_name,
             config={
-                "model": "RegionTransformer",
+                "model": "SANDMAN",
                 "target": getattr(target_spec, "name", str(type(target_spec))),
                 "diffusion_steps": noise_scheduler_args.get("num_train_timesteps"),
                 "max_epochs": max_epochs,

@@ -4,6 +4,7 @@ data/mice-ibl/*
 data/ibl_raw/*
 data/mice-MAP/*
 data/synthetic/*
+data/models/*
 Writeup/*.bbl
 Writeup/*.synctex.gz
 Writeup/*.aux
@@ -19,3 +20,4 @@ __pycache__/
 tests/*
 */wandb/*
 *.log
+wandb/*
